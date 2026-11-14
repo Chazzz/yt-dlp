@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     if: github.repository == 'Chazzz/yt-dlp'
-    uses: $/.github/workflows/build.yml
+    uses: ./.github/workflows/build.yml  # zizmor: ignore[self-repository] (actionlint 1.7.12 requires the relative syntax)
     with:
       version: '2026.10.26'
       channel: Chazzz/yt-dlp
