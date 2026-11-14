@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 from test.helper import FakeYDL
 from yt_dlp.extractor import gen_extractors
-from yt_dlp.extractor.wtv import WTVIE
+from yt_dlp.extractor.wtv import WTVChannelIE, WTVIE
 from yt_dlp.networking import Response
-from yt_dlp.utils import ExtractorError
+from yt_dlp.utils import ExtractorError, UserNotLive
 
 
 class TestWTV(unittest.TestCase):
@@ -91,6 +91,81 @@ class TestWTV(unittest.TestCase):
                              side_effect=ExtractorError('Manifest unavailable')):
             with self.assertRaisesRegex(ExtractorError, 'Manifest unavailable'):
                 self.ie._real_extract(self.URL)
+
+
+class TestWTVChannel(unittest.TestCase):
+    PROFILE = {'profile': {'userId': 'channel-1', 'nickname': 'Example'}}
+
+    def setUp(self):
+        self.ie = WTVChannelIE(FakeYDL())
+
+    def test_url_scope(self):
+        for url in ('https://w.tv/example', 'https://w.tv/example/videos/', 'https://w.tv/example?x=1'):
+            self.assertTrue(WTVChannelIE.suitable(url))
+            self.assertFalse(WTVIE.suitable(url))
+        self.assertFalse(WTVChannelIE.suitable(TestWTV.URL))
+        self.assertFalse(WTVChannelIE.suitable('https://w.tv/example/videos/extra'))
+
+    def test_archive_delegation_deduplication_and_live_exclusion(self):
+        finished = TestWTV.STREAM
+        live = {**finished, 'state': 'started'}
+        with patch.object(self.ie, '_download_json', side_effect=[
+                self.PROFILE, {'data': [finished, finished, live]}]) as request:
+            result = self.ie._real_extract('https://w.tv/example/videos')
+        self.assertEqual(result['id'], 'channel-1')
+        self.assertEqual(result['title'], 'Example - Videos')
+        self.assertEqual(len(result['entries']), 1)
+        self.assertEqual(result['entries'][0]['url'], TestWTV.URL)
+        self.assertEqual(result['entries'][0]['ie_key'], WTVIE.ie_key())
+        self.assertEqual(request.call_args.kwargs['query'], {'limit': 100})
+
+    def test_empty_archive(self):
+        with patch.object(self.ie, '_download_json', side_effect=[self.PROFILE, {'data': []}]):
+            self.assertEqual(self.ie._real_extract('https://w.tv/example/videos')['entries'], [])
+
+    def test_continuation_is_never_silently_ignored(self):
+        for key in ('cursor', 'nextCursor', 'next', 'hasMore'):
+            with self.subTest(key=key), patch.object(self.ie, '_download_json', side_effect=[
+                    self.PROFILE, {'data': [], key: 'opaque'}]) as request:
+                with self.assertRaisesRegex(ExtractorError, 'unsupported continuation'):
+                    self.ie._real_extract('https://w.tv/example/videos')
+                self.assertEqual(request.call_count, 2)
+
+    def test_limit_warning(self):
+        with patch.object(self.ie, '_download_json', side_effect=[
+                self.PROFILE, {'data': [TestWTV.STREAM] * 100}]), \
+                patch.object(self.ie, 'report_warning') as warning:
+            self.ie._real_extract('https://w.tv/example/videos')
+        warning.assert_called_once()
+
+    def test_unavailable_and_invalid_archive(self):
+        for response in ({}, {'data': None}, {'data': [None]},
+                         {'data': [{'state': 'finished', 'streamId': 'invalid'}]},
+                         {'data': [{'state': 'unknown'}]}):
+            with self.subTest(response=response), patch.object(self.ie, '_download_json', side_effect=[
+                    self.PROFILE, response]):
+                with self.assertRaises(ExtractorError):
+                    self.ie._real_extract('https://w.tv/example/videos')
+
+    def test_missing_profile(self):
+        with patch.object(self.ie, '_download_json', return_value={}):
+            with self.assertRaisesRegex(ExtractorError, 'Channel is unavailable'):
+                self.ie._real_extract('https://w.tv/example')
+
+    def test_offline_channel_does_not_become_archive(self):
+        with patch.object(self.ie, '_download_json', side_effect=[self.PROFILE, {'channel': {'live': False}}]):
+            with self.assertRaises(UserNotLive):
+                self.ie._real_extract('https://w.tv/example')
+
+    def test_live_uses_shared_parser_and_sets_live_flag(self):
+        stream = {**TestWTV.STREAM, 'state': 'started'}
+        with patch.object(self.ie, '_download_json', side_effect=[self.PROFILE, {
+                'channel': {'live': True, 'liveStreamId': TestWTV.ID, 'liveStream': stream}}]), \
+                patch.object(self.ie, '_extract_m3u8_formats_and_subtitles', return_value=([], {})) as hls:
+            result = self.ie._real_extract('https://w.tv/example')
+        self.assertTrue(result['is_live'])
+        self.assertEqual(result['id'], TestWTV.ID)
+        self.assertTrue(hls.call_args.kwargs['live'])
 
 
 if __name__ == '__main__':
