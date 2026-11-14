@@ -1,0 +1,58 @@
+name: Build w.tv macOS
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/wtv-macos.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'Chazzz/yt-dlp'
+    uses: ./.github/workflows/build.yml
+    with:
+      version: '2026.10.26'
+      channel: Chazzz/yt-dlp
+      origin: Chazzz/yt-dlp
+      unix: false
+      linux: false
+      linux_armv7l: false
+      musllinux: false
+      macos: true
+      verify_macos: false
+      windows: false
+
+  verify:
+    needs: build
+    strategy:
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    env:
+      YTDLP_NO_PLUGINS: 'true'
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: build-bin-macos
+      - name: Verify standalone executable
+        run: |
+          set -euo pipefail
+          chmod +x yt-dlp_macos
+          lipo -verify_arch arm64 x86_64 yt-dlp_macos
+          ./yt-dlp_macos --ignore-config --version
+          ./yt-dlp_macos --ignore-config --list-extractors > extractors.txt
+          grep -Fx 'w.tv' extractors.txt
+          grep -Fx 'w.tv:channel' extractors.txt
+          mv yt-dlp_macos yt-dlp_wtv_macos
+          shasum -a 256 yt-dlp_wtv_macos | tee SHA256SUMS
+          printf 'Source: %s\nRunner: %s\n' "$GITHUB_SHA" "$(uname -m)" > provenance.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: matrix.runner == 'macos-15'
+        with:
+          name: yt-dlp_wtv_macos-universal2
+          path: |
+            yt-dlp_wtv_macos
+            SHA256SUMS
+            provenance.txt
