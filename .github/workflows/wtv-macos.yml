@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x yt-dlp_macos
-          lipo -verify_arch arm64 x86_64 yt-dlp_macos
+          lipo yt-dlp_macos -verify_arch arm64 x86_64
           ./yt-dlp_macos --ignore-config --version
           ./yt-dlp_macos --ignore-config --list-extractors > extractors.txt
           grep -Fx 'w.tv' extractors.txt
