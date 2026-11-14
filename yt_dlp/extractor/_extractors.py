@@ -2309,6 +2309,7 @@ from .wsj import (
     WSJIE,
     WSJArticleIE,
 )
+from .wtv import WTVIE
 from .wwe import WWEIE
 from .wykop import (
     WykopDigCommentIE,
