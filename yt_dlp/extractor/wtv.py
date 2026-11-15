@@ -1,7 +1,6 @@
 import re
 
 from .common import InfoExtractor
-from ..networking.exceptions import HTTPError
 from ..utils import ExtractorError, UserNotLive, int_or_none, parse_iso8601, url_or_none
 from ..utils.traversal import traverse_obj
 
@@ -9,42 +8,12 @@ from ..utils.traversal import traverse_obj
 class WTVBaseIE(InfoExtractor):
     _UUID_RE = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 
-    def _call_api(self, url, video_id, **kwargs):
-        try:
-            return self._download_json(url, video_id, **kwargs)
-        except ExtractorError as error:
-            if isinstance(error.cause, HTTPError):
-                message = {
-                    401: 'w.tv requires authentication for this resource',
-                    403: 'w.tv denied access to this resource',
-                    404: 'w.tv resource was not found or is no longer available',
-                    410: 'w.tv resource is no longer available',
-                    429: 'w.tv rate limit reached; wait before trying again',
-                }.get(error.cause.status)
-                if message:
-                    raise ExtractorError(f'{message} (HTTP {error.cause.status})', expected=True, cause=error.cause)
-            raise
-
     def _extract_stream(self, stream, video_id, channel_slug, *, is_live=False):
         if stream.get('streamId') not in (None, video_id):
-            raise ExtractorError('Broadcast metadata has a mismatched video ID', expected=True)
-        playback_url = url_or_none(stream.get('playbackUrl'))
-        if not playback_url:
-            raise ExtractorError('No playback URL is available', expected=True)
+            raise ExtractorError('Broadcast metadata has a mismatched video ID')
 
-        try:
-            formats, subtitles = self._extract_m3u8_formats_and_subtitles(
-                playback_url, video_id, 'mp4', m3u8_id='hls', live=is_live)
-        except ExtractorError as error:
-            if isinstance(error.cause, HTTPError) and error.cause.status in (401, 403, 404, 410):
-                raise ExtractorError(
-                    f'Playback URL is unavailable or access was denied (HTTP {error.cause.status}); '
-                    'it may have expired. Run extraction again to obtain current metadata',
-                    expected=True, cause=error.cause)
-            if isinstance(error.cause, HTTPError) and error.cause.status == 429:
-                raise ExtractorError('w.tv playback rate limit reached (HTTP 429); wait before trying again',
-                                     expected=True, cause=error.cause)
-            raise
+        formats, subtitles = self._extract_m3u8_formats_and_subtitles(
+            url_or_none(stream.get('playbackUrl')), video_id, 'mp4', m3u8_id='hls', live=is_live)
         return {
             'id': video_id,
             'title': traverse_obj(stream, ('title', {str})) or video_id,
@@ -88,13 +57,15 @@ class WTVIE(WTVBaseIE):
 
     def _real_extract(self, url):
         channel_slug, video_id = self._match_valid_url(url).group('channel', 'id')
-        response = self._call_api(
+        response = self._download_json(
             f'https://streams-search-service.w.tv/api/v1/streams/{video_id}', video_id)
         stream = traverse_obj(response, ('stream', {dict}))
         if not stream:
-            raise ExtractorError('Video metadata is unavailable', expected=True)
-        if stream.get('state') not in (None, 'finished'):
-            raise ExtractorError('This broadcast is not a finished replay', expected=True)
+            raise ExtractorError('Video metadata is unavailable')
+        # Keep replay URLs from unexpectedly starting an ongoing live capture.
+        if stream.get('state') == 'started':
+            raise ExtractorError(
+                f'This broadcast is still live; use https://w.tv/{channel_slug} to record it', expected=True)
         return self._extract_stream(stream, video_id, channel_slug)
 
 
@@ -132,35 +103,28 @@ class WTVChannelIE(WTVBaseIE):
 
     def _real_extract(self, url):
         slug, archive = self._match_valid_url(url).group('id', 'archive')
-        profile = self._call_api(
+        profile = self._download_json(
             f'https://profiles-service.w.tv/api/v1/profiles/by-nickname/{slug}', slug)
         channel_id = traverse_obj(profile, ('profile', 'userId', {str}))
         if not channel_id or not re.fullmatch(self._UUID_RE, channel_id):
-            raise ExtractorError('Channel is unavailable', expected=True)
+            raise ExtractorError('Unable to extract channel ID')
         base_url = f'https://streams-search-service.w.tv/api/v1/channels/{channel_id}'
         if archive:
-            listing = self._call_api(base_url + '/streams', slug, query={'limit': 100})
+            listing = self._download_json(base_url + '/streams', slug, query={'limit': 100})
             if not isinstance(listing, dict) or not isinstance(listing.get('data'), list):
-                raise ExtractorError('Archive listing is unavailable', expected=True)
-            # No continuation is exposed by the observed API. Never guess cursor
-            # parameters or silently claim a partial result is a complete archive.
-            if any(listing.get(key) for key in ('cursor', 'nextCursor', 'next', 'hasMore')):
-                raise ExtractorError('Archive API exposes an unsupported continuation; cannot safely enumerate all entries', expected=True)
-            if isinstance(listing.get('total'), int) and listing['total'] > len(listing['data']):
-                raise ExtractorError('Archive API reports more entries than returned but exposes no supported continuation', expected=True)
+                raise ExtractorError('Archive listing is unavailable')
+            # The observed API and site client expose no pagination mechanism.
             if len(listing['data']) >= 100:
-                self.report_warning('Archive reached the requested limit; older entries may be unavailable because no continuation is exposed')
+                self.report_warning('Archive reached the requested limit; older entries may be missing')
             entries, seen = [], set()
             for stream in listing['data']:
-                if not isinstance(stream, dict):
-                    raise ExtractorError('Invalid archive entry', expected=True)
-                if stream.get('state') == 'started':
+                state = traverse_obj(stream, ('state', {str}))
+                if state == 'started':
                     continue
-                if stream.get('state') != 'finished':
-                    raise ExtractorError('Archive entry has an unrecognized broadcast state', expected=True)
-                video_id = stream.get('streamId')
-                if not isinstance(video_id, str) or not re.fullmatch(self._UUID_RE, video_id):
-                    raise ExtractorError('Archive entry has an invalid video ID', expected=True)
+                video_id = traverse_obj(stream, ('streamId', {str}))
+                if state != 'finished' or not video_id or not re.fullmatch(self._UUID_RE, video_id):
+                    self.report_warning('Skipping an invalid or unsupported archive entry', only_once=True)
+                    continue
                 if video_id in seen:
                     continue
                 seen.add(video_id)
@@ -170,15 +134,15 @@ class WTVChannelIE(WTVBaseIE):
             title = traverse_obj(profile, ('profile', 'nickname', {str})) or slug
             return self.playlist_result(entries, channel_id, f'{title} - Videos')
 
-        channel = traverse_obj(self._call_api(base_url, slug), ('channel', {dict}))
+        channel = traverse_obj(self._download_json(base_url, slug), ('channel', {dict}))
         if not channel:
-            raise ExtractorError('Channel metadata is unavailable', expected=True)
+            raise ExtractorError('Channel metadata is unavailable')
         if channel.get('live') is False:
             raise UserNotLive(video_id=slug)
         if channel.get('live') is not True:
-            raise ExtractorError('Channel metadata has no valid live status', expected=True)
+            raise ExtractorError('Channel metadata has no valid live status')
         stream = traverse_obj(channel, ('liveStream', {dict}))
         video_id = traverse_obj(channel, ('liveStreamId', {str}))
         if not stream or not video_id or not re.fullmatch(self._UUID_RE, video_id):
-            raise ExtractorError('Live broadcast metadata is unavailable', expected=True)
+            raise ExtractorError('Live broadcast metadata is unavailable')
         return self._extract_stream(stream, video_id, slug, is_live=True)
